@@ -1,14 +1,13 @@
 use anyhow::{bail, Context};
-use clients::gitlab::GitlabClient;
-use clients::GitRepositoryClient;
-use clients::{github::GithubClient, GitRemoteClient};
+use clients::crates_io::CratesioClient;
+use clients::git::GithubClient;
+use clients::git::GitlabClient;
+use clients::MetadataClient;
 use cratesio_dbdump_csvtab::CratesIODumpLoader;
 use serde::Deserialize;
 use std::{fs, path::PathBuf, str::FromStr};
 
 pub mod clients;
-
-type CratesIoDb = cratesio_dbdump_csvtab::rusqlite::Connection;
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
@@ -84,7 +83,7 @@ impl AssetNode {
 fn visit_dirs(
     dir: PathBuf,
     section: &mut Section,
-    crates_io_db: Option<&CratesIoDb>,
+    crates_io_client: Option<&CratesioClient>,
     github_client: Option<&GithubClient>,
     gitlab_client: Option<&GitlabClient>,
 ) -> anyhow::Result<()> {
@@ -128,7 +127,7 @@ fn visit_dirs(
             visit_dirs(
                 path.clone(),
                 &mut new_section,
-                crates_io_db,
+                crates_io_client,
                 github_client,
                 gitlab_client,
             )?;
@@ -144,7 +143,7 @@ fn visit_dirs(
             asset.original_path = Some(path);
 
             if let Err(err) =
-                get_extra_metadata(&mut asset, crates_io_db, github_client, gitlab_client)
+                get_extra_metadata(&mut asset, crates_io_client, github_client, gitlab_client)
             {
                 // We don't want to stop execution here
                 eprintln!("Failed to get metadata for {}", asset.name);
@@ -160,7 +159,7 @@ fn visit_dirs(
 
 pub fn parse_assets(
     asset_dir: &str,
-    crates_io_db: Option<&CratesIoDb>,
+    crates_io_client: Option<&CratesioClient>,
     github_client: Option<&GithubClient>,
     gitlab_client: Option<&GitlabClient>,
 ) -> anyhow::Result<Section> {
@@ -175,7 +174,7 @@ pub fn parse_assets(
     visit_dirs(
         PathBuf::from_str(asset_dir).unwrap(),
         &mut asset_root_section,
-        crates_io_db,
+        crates_io_client,
         github_client,
         gitlab_client,
     )?;
@@ -185,18 +184,17 @@ pub fn parse_assets(
 /// Tries to get bevy supported version and license information from various external sources
 fn get_extra_metadata(
     asset: &mut Asset,
-    crates_io_db: Option<&CratesIoDb>,
+    crates_io_client: Option<&CratesioClient>,
     github_client: Option<&GithubClient>,
     gitlab_client: Option<&GitlabClient>,
 ) -> anyhow::Result<()> {
     println!("Getting extra metadata for {}", asset.name);
 
     let url = url::Url::parse(&asset.link)?;
-    let segments = url.path_segments().map(|c| c.collect::<Vec<_>>()).unwrap();
 
     let metadata = match url.host_str() {
-        Some("crates.io") if crates_io_db.is_some() => {
-            if let Some(db) = crates_io_db {
+        Some("crates.io") if crates_io_client.is_some() => {
+            if let Some(db) = crates_io_client {
                 let crate_name = segments[1];
                 Some(get_metadata_from_crates_io_db(db, crate_name)?)
             } else {
@@ -232,81 +230,6 @@ fn get_extra_metadata(
     Ok(())
 }
 
-fn get_metadata_from_git<C>(
-    client: &C,
-    url: url::Url,
-) -> anyhow::Result<(Option<String>, Option<String>)>
-where
-    C: GitRepositoryClient,
-{
-    let content = client
-        .try_get_file_content("Cargo.toml")
-        .context("Failed to get Cargo.toml from github")?;
-
-    let cargo_manifest = toml::from_str::<cargo_toml::Manifest>(&content)?;
-    Ok((
-        get_license(&cargo_manifest),
-        get_bevy_version(&cargo_manifest),
-    ))
-}
-
-/// Gets the bevy version from the dependency list
-/// Returns the version number if available.
-/// If is is a git dependency, return either "main" or "git" for anything that isn't "main".
-fn get_bevy_dependency_version(dep: &cargo_toml::Dependency) -> Option<String> {
-    match dep {
-        cargo_toml::Dependency::Simple(version) => Some(version.to_string()),
-        cargo_toml::Dependency::Detailed(detail) => {
-            if let Some(version) = &detail.version {
-                Some(version.to_string())
-            } else if detail.git.is_some() {
-                if detail.branch == Some(String::from("main")) {
-                    Some(String::from("main"))
-                } else {
-                    Some(String::from("git"))
-                }
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// Gets the license from a Cargo.toml file
-/// Tries to emulate crates.io behaviour
-fn get_license(cargo_manifest: &cargo_toml::Manifest) -> Option<String> {
-    // Get the license from the package information
-    if let Some(cargo_toml::Package {
-        license,
-        license_file,
-        ..
-    }) = &cargo_manifest.package
-    {
-        if let Some(license) = license {
-            Some(license.clone())
-        } else {
-            license_file.as_ref().map(|_| String::from("non-standard"))
-        }
-    } else {
-        None
-    }
-}
-
-/// Find any dep that starts with bevy and get the version
-/// This makes sure to handle all the bevy_* crates
-fn get_bevy_version(cargo_manifest: &cargo_toml::Manifest) -> Option<String> {
-    cargo_manifest
-        .dependencies
-        .keys()
-        .find(|k| k.starts_with("bevy"))
-        .and_then(|key| {
-            cargo_manifest
-                .dependencies
-                .get(key)
-                .and_then(get_bevy_dependency_version)
-        })
-}
-
 /// Downloads the crates.io database dump and open a connection to the db
 pub fn prepare_crates_db() -> anyhow::Result<CratesIoDb> {
     let cache_dir = {
@@ -326,38 +249,4 @@ pub fn prepare_crates_db() -> anyhow::Result<CratesIoDb> {
         .preload(true)
         .update()?
         .open_db()?)
-}
-
-/// Gets the required metadata from the crates.io database dump
-fn get_metadata_from_crates_io_db(
-    db: &CratesIoDb,
-    crate_name: &str,
-) -> anyhow::Result<(Option<String>, Option<String>)> {
-    if let Ok(metadata) = get_metadata_from_db_by_crate_name(db, crate_name) {
-        Ok(metadata)
-    } else if let Ok(metadata) =
-        get_metadata_from_db_by_crate_name(db, &crate_name.replace('_', "-"))
-    {
-        Ok(metadata)
-    } else {
-        bail!("Failed to get data from crates.io db for {crate_name}")
-    }
-}
-
-fn get_metadata_from_db_by_crate_name(
-    db: &CratesIoDb,
-    crate_name: &str,
-) -> anyhow::Result<(Option<String>, Option<String>)> {
-    if let Some(Ok((_, _, license, _, deps))) =
-        &cratesio_dbdump_lookup::get_rev_dependency(db, crate_name, "bevy")?.first()
-    {
-        let version = deps
-            .as_ref()
-            .ok()
-            .and_then(|deps| deps.first())
-            .map(|(version, _)| version.clone());
-        Ok((Some(license.clone()), version))
-    } else {
-        bail!("Not found in crates.io db: {crate_name}")
-    }
 }
