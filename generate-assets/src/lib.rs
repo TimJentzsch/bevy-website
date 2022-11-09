@@ -1,12 +1,11 @@
 use anyhow::{bail, Context};
+use clients::github::GithubClient;
+use clients::gitlab::GitlabClient;
 use cratesio_dbdump_csvtab::CratesIODumpLoader;
-use github_client::GithubClient;
-use gitlab_client::GitlabClient;
 use serde::Deserialize;
 use std::{fs, path::PathBuf, str::FromStr};
 
-pub mod github_client;
-pub mod gitlab_client;
+pub mod clients;
 
 type CratesIoDb = cratesio_dbdump_csvtab::rusqlite::Connection;
 

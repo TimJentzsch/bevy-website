@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-use generate_assets::{github_client::GithubClient, gitlab_client::GitlabClient, *};
+use generate_assets::{clients::github::GithubClient, clients::gitlab::GitlabClient, *};
 
 fn main() -> anyhow::Result<()> {
     // Don't fail if file is not present, like in CI, just ignore it
