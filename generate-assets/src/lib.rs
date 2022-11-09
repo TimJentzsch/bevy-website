@@ -1,6 +1,7 @@
 use anyhow::{bail, Context};
-use clients::github::GithubClient;
 use clients::gitlab::GitlabClient;
+use clients::GitRepositoryClient;
+use clients::{github::GithubClient, GitRemoteClient};
 use cratesio_dbdump_csvtab::CratesIODumpLoader;
 use serde::Deserialize;
 use std::{fs, path::PathBuf, str::FromStr};
@@ -192,6 +193,7 @@ fn get_extra_metadata(
 
     let url = url::Url::parse(&asset.link)?;
     let segments = url.path_segments().map(|c| c.collect::<Vec<_>>()).unwrap();
+
     let metadata = match url.host_str() {
         Some("crates.io") if crates_io_db.is_some() => {
             if let Some(db) = crates_io_db {
@@ -205,7 +207,7 @@ fn get_extra_metadata(
             if let Some(client) = github_client {
                 let username = segments[0];
                 let repository_name = segments[1];
-                Some(get_metadata_from_github(client, username, repository_name)?)
+                Some(get_metadata_from_git(client, username, repository_name)?)
             } else {
                 None
             }
@@ -230,35 +232,16 @@ fn get_extra_metadata(
     Ok(())
 }
 
-fn get_metadata_from_github(
-    client: &GithubClient,
-    username: &str,
-    repository_name: &str,
-) -> anyhow::Result<(Option<String>, Option<String>)> {
+fn get_metadata_from_git<C>(
+    client: &C,
+    url: url::Url,
+) -> anyhow::Result<(Option<String>, Option<String>)>
+where
+    C: GitRepositoryClient,
+{
     let content = client
-        .get_content(username, repository_name, "Cargo.toml")
+        .try_get_file_content("Cargo.toml")
         .context("Failed to get Cargo.toml from github")?;
-
-    let cargo_manifest = toml::from_str::<cargo_toml::Manifest>(&content)?;
-    Ok((
-        get_license(&cargo_manifest),
-        get_bevy_version(&cargo_manifest),
-    ))
-}
-
-fn get_metadata_from_gitlab(
-    client: &GitlabClient,
-    repository_name: &str,
-) -> anyhow::Result<(Option<String>, Option<String>)> {
-    let search_result = client.search_project_by_name(repository_name)?;
-
-    let repo = search_result
-        .first()
-        .context("Failed to find gitlab repo")?;
-
-    let content = client
-        .get_content(repo.id, &repo.default_branch, "Cargo.toml")
-        .context("Failed to get Cargo.toml from gitlab")?;
 
     let cargo_manifest = toml::from_str::<cargo_toml::Manifest>(&content)?;
     Ok((
